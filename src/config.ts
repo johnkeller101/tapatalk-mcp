@@ -6,7 +6,7 @@ export interface Config {
   readOnly: boolean;
   timeoutMs: number;
   maxResponseSize: number;
-  flareSolverrUrl?: string;
+  chromeCdpUrl?: string;
 }
 
 export function loadConfig(): Config {
@@ -39,15 +39,6 @@ export function loadConfig(): Config {
   const readOnlyEnv = process.env.TAPATALK_READ_ONLY;
   const readOnly = readOnlyEnv === undefined || readOnlyEnv !== "false";
 
-  const flareSolverrUrl = process.env.TAPATALK_FLARESOLVERR_URL;
-  if (flareSolverrUrl) {
-    try {
-      new URL(flareSolverrUrl);
-    } catch {
-      throw new Error(`TAPATALK_FLARESOLVERR_URL is not a valid URL: ${flareSolverrUrl}`);
-    }
-  }
-
   return {
     forumUrl: normalized,
     mobiquoUrl: `${normalized}/mobiquo/mobiquo.php`,
@@ -56,6 +47,6 @@ export function loadConfig(): Config {
     readOnly,
     timeoutMs: 15000,
     maxResponseSize: 5 * 1024 * 1024, // 5MB
-    flareSolverrUrl: flareSolverrUrl?.replace(/\/+$/, ""),
+    chromeCdpUrl: process.env.TAPATALK_CHROME_CDP_URL,
   };
 }

@@ -4,8 +4,9 @@
  * Security: no redirect following to other hosts, response size limits,
  * request timeouts, cookie scope limited to the configured domain.
  *
- * Optional FlareSolverr integration: when configured and a 403 is received,
- * uses FlareSolverr to obtain Cloudflare clearance cookies, then retries.
+ * Optional Chrome CDP integration: when configured and direct requests
+ * get 403 (Cloudflare), connects to a headless Chrome instance via
+ * Puppeteer and executes fetch() from within the browser context.
  */
 
 import { buildMethodCall, type ParamType } from "./serialize.js";
@@ -18,22 +19,7 @@ export interface XmlRpcClientOptions {
   url: string;
   timeoutMs: number;
   maxResponseSize: number;
-  flareSolverrUrl?: string;
-}
-
-interface FlareSolverrCookie {
-  name: string;
-  value: string;
-  domain?: string;
-}
-
-interface FlareSolverrResponse {
-  status: string;
-  solution?: {
-    cookies?: FlareSolverrCookie[];
-    userAgent?: string;
-    status?: number;
-  };
+  chromeCdpUrl?: string;
 }
 
 export class XmlRpcClient {
@@ -42,15 +28,18 @@ export class XmlRpcClient {
   private readonly hostname: string;
   private readonly timeoutMs: number;
   private readonly maxResponseSize: number;
-  private readonly flareSolverrUrl?: string;
-  private flareSolverrUserAgent?: string;
+  private readonly chromeCdpUrl?: string;
+  private browserPage: unknown = null;
+  private browserPageCreatedAt = 0;
+  private readonly browserPageTtlMs = 10 * 60 * 1000; // 10 minutes
+  private useBrowser = false;
 
   constructor(options: XmlRpcClientOptions) {
     this.url = options.url;
     this.hostname = new URL(options.url).hostname;
     this.timeoutMs = options.timeoutMs;
     this.maxResponseSize = options.maxResponseSize;
-    this.flareSolverrUrl = options.flareSolverrUrl;
+    this.chromeCdpUrl = options.chromeCdpUrl;
   }
 
   async call(
@@ -61,21 +50,23 @@ export class XmlRpcClient {
     const body = buildMethodCall(method, params, paramTypes);
     logger.debug(`XML-RPC call: ${method}`, { paramCount: params.length });
 
+    // If we've already switched to browser mode, use it directly
+    if (this.useBrowser && this.chromeCdpUrl) {
+      return await this.doBrowserFetch(method, body);
+    }
+
     try {
-      return await this.doFetch(method, body);
+      return await this.doDirectFetch(method, body);
     } catch (err) {
-      // On 403, try FlareSolverr fallback if configured
+      // On 403, switch to browser mode if Chrome CDP is configured
       if (
-        this.flareSolverrUrl &&
+        this.chromeCdpUrl &&
         err instanceof Error &&
         err.message.includes("HTTP 403")
       ) {
-        logger.info("Got 403, attempting FlareSolverr clearance...");
-        const solved = await this.solveClearance();
-        if (solved) {
-          logger.info("FlareSolverr clearance obtained, retrying request");
-          return await this.doFetch(method, body);
-        }
+        logger.info("Got 403, switching to browser-proxied requests via Chrome CDP...");
+        this.useBrowser = true;
+        return await this.doBrowserFetch(method, body);
       }
       throw err;
     }
@@ -89,20 +80,16 @@ export class XmlRpcClient {
     return this.cookies.size > 0;
   }
 
-  private async doFetch(method: string, body: string): Promise<unknown> {
+  private async doDirectFetch(method: string, body: string): Promise<unknown> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const userAgent =
-        this.flareSolverrUserAgent ??
-        "Tapatalk/8.9.7 (Android; com.quoord.tapatalkpro.activity)";
-
       const response = await fetch(this.url, {
         method: "POST",
         headers: {
           "Content-Type": "text/xml; charset=utf-8",
-          "User-Agent": userAgent,
+          "User-Agent": "Tapatalk/8.9.7 (Android; com.quoord.tapatalkpro.activity)",
           "Accept-Encoding": "gzip, deflate",
           ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
         },
@@ -118,17 +105,10 @@ export class XmlRpcClient {
           try {
             const redirectHost = new URL(location, this.url).hostname;
             if (redirectHost !== this.hostname) {
-              throw new Error(
-                `Refusing redirect to different host: ${redirectHost}`,
-              );
+              throw new Error(`Refusing redirect to different host: ${redirectHost}`);
             }
           } catch (e) {
-            if (
-              e instanceof Error &&
-              e.message.includes("Refusing redirect")
-            ) {
-              throw e;
-            }
+            if (e instanceof Error && e.message.includes("Refusing redirect")) throw e;
             throw new Error(`Malformed redirect URL: ${location}`);
           }
         }
@@ -139,10 +119,8 @@ export class XmlRpcClient {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
-      // Capture cookies
       this.captureCookies(response.headers);
 
-      // Read response with size limit
       const responseBody = await this.readResponseBody(response);
       const result = parseMethodResponse(responseBody);
 
@@ -154,62 +132,109 @@ export class XmlRpcClient {
   }
 
   /**
-   * Call FlareSolverr to get Cloudflare clearance cookies.
-   * Uses request.get on the forum base URL (not mobiquo endpoint)
-   * to obtain cf_clearance and session cookies.
+   * Execute an XML-RPC call from within a headless Chrome browser context.
+   * The browser's real TLS fingerprint and network stack bypass Cloudflare.
    */
-  private async solveClearance(): Promise<boolean> {
-    if (!this.flareSolverrUrl) return false;
+  private async doBrowserFetch(method: string, body: string): Promise<unknown> {
+    const page = await this.getOrCreatePage();
 
-    try {
-      // Request the mobiquo URL through FlareSolverr
-      const resp = await fetch(`${this.flareSolverrUrl}/v1`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cmd: "request.get",
-          url: this.url,
-          maxTimeout: 60000,
-        }),
-      });
-
-      if (!resp.ok) {
-        logger.warn(`FlareSolverr returned HTTP ${resp.status}`);
-        return false;
-      }
-
-      const data = (await resp.json()) as FlareSolverrResponse;
-
-      if (data.status !== "ok" || !data.solution) {
-        logger.warn(`FlareSolverr failed: ${data.status}`);
-        return false;
-      }
-
-      // Import cookies from FlareSolverr
-      const cookies = data.solution.cookies ?? [];
-      let imported = 0;
-      for (const cookie of cookies) {
-        if (cookie.name && cookie.value !== undefined) {
-          this.cookies.set(cookie.name, cookie.value);
-          imported++;
+    // Use page.evaluate to run fetch() inside the browser
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await (page as any).evaluate(
+      async (url: string, xmlBody: string, timeoutMs: number) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "text/xml; charset=utf-8" },
+            body: xmlBody,
+            signal: controller.signal,
+          });
+          if (!resp.ok) {
+            return { error: `HTTP ${resp.status}: ${resp.statusText}` };
+          }
+          const text = await resp.text();
+          return { body: text };
+        } catch (e: unknown) {
+          return { error: (e as Error).message || String(e) };
+        } finally {
+          clearTimeout(timer);
         }
-      }
+      },
+      this.url,
+      body,
+      this.timeoutMs,
+    );
 
-      // Use the same User-Agent FlareSolverr used (must match for cf_clearance)
-      if (data.solution.userAgent) {
-        this.flareSolverrUserAgent = data.solution.userAgent;
-      }
-
-      logger.info(
-        `FlareSolverr: imported ${imported} cookies, UA: ${this.flareSolverrUserAgent ? "set" : "default"}`,
-      );
-      return imported > 0;
-    } catch (e) {
-      logger.warn(
-        `FlareSolverr request failed: ${(e as Error).message}`,
-      );
-      return false;
+    if (result.error) {
+      throw new Error(result.error);
     }
+
+    if (result.body.length > this.maxResponseSize) {
+      throw new Error(
+        `Response too large: ${result.body.length} chars (limit: ${this.maxResponseSize})`,
+      );
+    }
+
+    const parsed = parseMethodResponse(result.body);
+    logger.debug(`XML-RPC response (browser): ${method} OK`);
+    return parsed;
+  }
+
+  /**
+   * Get or create a persistent browser page.
+   * First time: connects to Chrome via CDP, opens the forum URL to
+   * establish Cloudflare clearance, then reuses the page for fetch() calls.
+   */
+  private async getOrCreatePage(): Promise<unknown> {
+    // Expire stale pages to avoid using a disconnected browser
+    if (
+      this.browserPage &&
+      Date.now() - this.browserPageCreatedAt > this.browserPageTtlMs
+    ) {
+      logger.info("Browser page TTL expired, reconnecting...");
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const page = this.browserPage as any;
+        const browser = page.browser();
+        await page.close().catch(() => {});
+        await browser.disconnect().catch(() => {});
+      } catch { /* ignore cleanup errors */ }
+      this.browserPage = null;
+    }
+
+    if (this.browserPage) return this.browserPage;
+
+    if (!this.chromeCdpUrl) {
+      throw new Error("Chrome CDP URL not configured");
+    }
+
+    // Dynamic import — puppeteer-core is only needed when Chrome mode is active
+    const puppeteer = await import("puppeteer-core");
+
+    // Get the WebSocket URL from the Chrome CDP endpoint
+    const versionResp = await fetch(`${this.chromeCdpUrl}/json/version`);
+    if (!versionResp.ok) {
+      throw new Error(`Chrome CDP not reachable: HTTP ${versionResp.status}`);
+    }
+    const versionData = (await versionResp.json()) as { webSocketDebuggerUrl: string };
+    const wsUrl = versionData.webSocketDebuggerUrl;
+
+    logger.info(`Connecting to Chrome at ${wsUrl}`);
+    const browser = await puppeteer.default.connect({ browserWSEndpoint: wsUrl });
+
+    const page = await browser.newPage();
+
+    // Navigate to the forum first to establish Cloudflare clearance
+    const forumBaseUrl = this.url.replace(/\/mobiquo\/mobiquo\.php$/, "");
+    logger.info(`Navigating to ${forumBaseUrl} to establish clearance...`);
+    await page.goto(forumBaseUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    logger.info("Browser clearance established");
+
+    this.browserPage = page;
+    this.browserPageCreatedAt = Date.now();
+    return page;
   }
 
   private cookieHeader(): string | undefined {
@@ -257,10 +282,7 @@ export class XmlRpcClient {
       p.trim().toLowerCase().startsWith("domain="),
     );
     if (domainPart) {
-      const cookieDomain = domainPart
-        .split("=")[1]
-        ?.trim()
-        .replace(/^\./, "");
+      const cookieDomain = domainPart.split("=")[1]?.trim().replace(/^\./, "");
       if (
         cookieDomain &&
         this.hostname !== cookieDomain &&

@@ -21,8 +21,8 @@ async function main(): Promise<void> {
   const config = loadConfig();
   logger.info(`Forum URL: ${config.forumUrl}`);
   logger.info(`Read-only mode: ${config.readOnly}`);
-  if (config.flareSolverrUrl) {
-    logger.info(`FlareSolverr: ${config.flareSolverrUrl} (fallback on 403)`);
+  if (config.chromeCdpUrl) {
+    logger.info(`Chrome CDP: ${config.chromeCdpUrl} (browser-proxied requests)`);
   }
 
   // Create XML-RPC client
@@ -30,7 +30,7 @@ async function main(): Promise<void> {
     url: config.mobiquoUrl,
     timeoutMs: config.timeoutMs,
     maxResponseSize: config.maxResponseSize,
-    flareSolverrUrl: config.flareSolverrUrl,
+    chromeCdpUrl: config.chromeCdpUrl,
   });
 
   // Create Tapatalk client
