@@ -214,10 +214,7 @@ export class XmlRpcClient {
     const puppeteer = await import("puppeteer-core");
 
     // Get the WebSocket URL from the Chrome CDP endpoint
-    // Chrome rejects requests where Host isn't localhost/IP, so override it
-    const versionResp = await fetch(`${this.chromeCdpUrl}/json/version`, {
-      headers: { Host: "localhost" },
-    });
+    const versionResp = await fetch(`${this.chromeCdpUrl}/json/version`);
     if (!versionResp.ok) {
       throw new Error(`Chrome CDP not reachable: HTTP ${versionResp.status}`);
     }
