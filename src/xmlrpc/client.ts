@@ -3,6 +3,9 @@
  *
  * Security: no redirect following to other hosts, response size limits,
  * request timeouts, cookie scope limited to the configured domain.
+ *
+ * Optional FlareSolverr integration: when configured and a 403 is received,
+ * uses FlareSolverr to obtain Cloudflare clearance cookies, then retries.
  */
 
 import { buildMethodCall, type ParamType } from "./serialize.js";
@@ -15,6 +18,22 @@ export interface XmlRpcClientOptions {
   url: string;
   timeoutMs: number;
   maxResponseSize: number;
+  flareSolverrUrl?: string;
+}
+
+interface FlareSolverrCookie {
+  name: string;
+  value: string;
+  domain?: string;
+}
+
+interface FlareSolverrResponse {
+  status: string;
+  solution?: {
+    cookies?: FlareSolverrCookie[];
+    userAgent?: string;
+    status?: number;
+  };
 }
 
 export class XmlRpcClient {
@@ -23,12 +42,15 @@ export class XmlRpcClient {
   private readonly hostname: string;
   private readonly timeoutMs: number;
   private readonly maxResponseSize: number;
+  private readonly flareSolverrUrl?: string;
+  private flareSolverrUserAgent?: string;
 
   constructor(options: XmlRpcClientOptions) {
     this.url = options.url;
     this.hostname = new URL(options.url).hostname;
     this.timeoutMs = options.timeoutMs;
     this.maxResponseSize = options.maxResponseSize;
+    this.flareSolverrUrl = options.flareSolverrUrl;
   }
 
   async call(
@@ -39,21 +61,54 @@ export class XmlRpcClient {
     const body = buildMethodCall(method, params, paramTypes);
     logger.debug(`XML-RPC call: ${method}`, { paramCount: params.length });
 
+    try {
+      return await this.doFetch(method, body);
+    } catch (err) {
+      // On 403, try FlareSolverr fallback if configured
+      if (
+        this.flareSolverrUrl &&
+        err instanceof Error &&
+        err.message.includes("HTTP 403")
+      ) {
+        logger.info("Got 403, attempting FlareSolverr clearance...");
+        const solved = await this.solveClearance();
+        if (solved) {
+          logger.info("FlareSolverr clearance obtained, retrying request");
+          return await this.doFetch(method, body);
+        }
+      }
+      throw err;
+    }
+  }
+
+  clearCookies(): void {
+    this.cookies.clear();
+  }
+
+  hasCookies(): boolean {
+    return this.cookies.size > 0;
+  }
+
+  private async doFetch(method: string, body: string): Promise<unknown> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
+      const userAgent =
+        this.flareSolverrUserAgent ??
+        "Tapatalk/8.9.7 (Android; com.quoord.tapatalkpro.activity)";
+
       const response = await fetch(this.url, {
         method: "POST",
         headers: {
           "Content-Type": "text/xml; charset=utf-8",
-          "User-Agent": "Tapatalk/8.9.7 (Android; com.quoord.tapatalkpro.activity)",
+          "User-Agent": userAgent,
           "Accept-Encoding": "gzip, deflate",
           ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
         },
         body,
         signal: controller.signal,
-        redirect: "manual", // Don't follow redirects (SSRF prevention)
+        redirect: "manual",
       });
 
       // Check for redirects to other hosts
@@ -68,10 +123,12 @@ export class XmlRpcClient {
               );
             }
           } catch (e) {
-            if (e instanceof Error && e.message.includes("Refusing redirect")) {
+            if (
+              e instanceof Error &&
+              e.message.includes("Refusing redirect")
+            ) {
               throw e;
             }
-            // Malformed URL in redirect — reject
             throw new Error(`Malformed redirect URL: ${location}`);
           }
         }
@@ -96,12 +153,63 @@ export class XmlRpcClient {
     }
   }
 
-  clearCookies(): void {
-    this.cookies.clear();
-  }
+  /**
+   * Call FlareSolverr to get Cloudflare clearance cookies.
+   * Uses request.get on the forum base URL (not mobiquo endpoint)
+   * to obtain cf_clearance and session cookies.
+   */
+  private async solveClearance(): Promise<boolean> {
+    if (!this.flareSolverrUrl) return false;
 
-  hasCookies(): boolean {
-    return this.cookies.size > 0;
+    try {
+      // Request the mobiquo URL through FlareSolverr
+      const resp = await fetch(`${this.flareSolverrUrl}/v1`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cmd: "request.get",
+          url: this.url,
+          maxTimeout: 60000,
+        }),
+      });
+
+      if (!resp.ok) {
+        logger.warn(`FlareSolverr returned HTTP ${resp.status}`);
+        return false;
+      }
+
+      const data = (await resp.json()) as FlareSolverrResponse;
+
+      if (data.status !== "ok" || !data.solution) {
+        logger.warn(`FlareSolverr failed: ${data.status}`);
+        return false;
+      }
+
+      // Import cookies from FlareSolverr
+      const cookies = data.solution.cookies ?? [];
+      let imported = 0;
+      for (const cookie of cookies) {
+        if (cookie.name && cookie.value !== undefined) {
+          this.cookies.set(cookie.name, cookie.value);
+          imported++;
+        }
+      }
+
+      // Use the same User-Agent FlareSolverr used (must match for cf_clearance)
+      if (data.solution.userAgent) {
+        this.flareSolverrUserAgent = data.solution.userAgent;
+      }
+
+      logger.info(
+        `FlareSolverr: imported ${imported} cookies, UA: ${this.flareSolverrUserAgent ? "set" : "default"}`,
+      );
+      return imported > 0;
+    } catch (e) {
+      logger.warn(
+        `FlareSolverr request failed: ${(e as Error).message}`,
+      );
+      return false;
+    }
   }
 
   private cookieHeader(): string | undefined {
@@ -114,18 +222,14 @@ export class XmlRpcClient {
   }
 
   private captureCookies(headers: Headers): void {
-    // fetch() combines multiple Set-Cookie into getSetCookie()
     const setCookies =
       "getSetCookie" in headers
         ? (headers as unknown as { getSetCookie(): string[] }).getSetCookie()
         : [];
 
-    // Fallback for environments without getSetCookie
     if (setCookies.length === 0) {
       const raw = headers.get("set-cookie");
       if (raw) {
-        // Multiple cookies may be comma-separated (RFC 6265 allows this)
-        // but safer to split on the pattern
         for (const part of raw.split(/,(?=\s*\w+=)/)) {
           this.parseSingleCookie(part.trim());
         }
@@ -149,12 +253,14 @@ export class XmlRpcClient {
     const name = nameValue.substring(0, eqIdx).trim();
     const value = nameValue.substring(eqIdx + 1).trim();
 
-    // Check domain scope — only accept cookies for our forum's domain
     const domainPart = parts.find((p) =>
       p.trim().toLowerCase().startsWith("domain="),
     );
     if (domainPart) {
-      const cookieDomain = domainPart.split("=")[1]?.trim().replace(/^\./, "");
+      const cookieDomain = domainPart
+        .split("=")[1]
+        ?.trim()
+        .replace(/^\./, "");
       if (
         cookieDomain &&
         this.hostname !== cookieDomain &&
@@ -169,7 +275,6 @@ export class XmlRpcClient {
   }
 
   private async readResponseBody(response: Response): Promise<string> {
-    // Use arrayBuffer for size checking, then decode
     const buffer = await response.arrayBuffer();
     if (buffer.byteLength > this.maxResponseSize) {
       throw new Error(

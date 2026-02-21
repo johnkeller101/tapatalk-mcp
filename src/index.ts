@@ -21,12 +21,16 @@ async function main(): Promise<void> {
   const config = loadConfig();
   logger.info(`Forum URL: ${config.forumUrl}`);
   logger.info(`Read-only mode: ${config.readOnly}`);
+  if (config.flareSolverrUrl) {
+    logger.info(`FlareSolverr: ${config.flareSolverrUrl} (fallback on 403)`);
+  }
 
   // Create XML-RPC client
   const rpc = new XmlRpcClient({
     url: config.mobiquoUrl,
     timeoutMs: config.timeoutMs,
     maxResponseSize: config.maxResponseSize,
+    flareSolverrUrl: config.flareSolverrUrl,
   });
 
   // Create Tapatalk client
