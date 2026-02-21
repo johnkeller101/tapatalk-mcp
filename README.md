@@ -52,6 +52,16 @@ When credentials are provided, the server logs in once on startup and automatica
 
 Without credentials, the server operates in guest mode with access to public forums only.
 
+### Optional — Cloudflare Bypass
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TAPATALK_CHROME_CDP_URL` | URL of a headless Chrome instance for Cloudflare-protected forums | _(none — direct requests)_ |
+
+Some forums use Cloudflare which blocks server-side requests. When configured, the server first tries a direct request. If it gets a 403, it automatically connects to the headless Chrome instance via CDP, navigates to the forum to establish Cloudflare clearance, then executes XML-RPC calls from within the browser context using the browser's real TLS fingerprint. The browser page is cached for 10 minutes and automatically reconnects when stale.
+
+Example: `TAPATALK_CHROME_CDP_URL=http://chrome:9222` (when running alongside a `chromedp/headless-shell` container).
+
 ### Optional — Safety
 
 | Variable | Description | Default |
@@ -102,6 +112,25 @@ Add the server to your Claude Code MCP configuration:
 ```
 
 This gives you access to private forums and features like unread topics, while keeping write operations disabled.
+
+### With Cloudflare bypass (headless Chrome)
+
+```json
+{
+  "mcpServers": {
+    "tapatalk": {
+      "command": "node",
+      "args": ["/path/to/tapatalk-mcp/dist/index.js"],
+      "env": {
+        "TAPATALK_FORUM_URL": "https://forums.example.com",
+        "TAPATALK_CHROME_CDP_URL": "http://localhost:9222"
+      }
+    }
+  }
+}
+```
+
+Requires a headless Chrome instance running with remote debugging enabled (e.g. `chromedp/headless-shell:stable`).
 
 ### With write access
 
