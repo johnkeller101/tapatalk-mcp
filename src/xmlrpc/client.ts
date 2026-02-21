@@ -214,12 +214,17 @@ export class XmlRpcClient {
     const puppeteer = await import("puppeteer-core");
 
     // Get the WebSocket URL from the Chrome CDP endpoint
-    const versionResp = await fetch(`${this.chromeCdpUrl}/json/version`);
+    // Chrome rejects requests where Host isn't localhost/IP, so override it
+    const versionResp = await fetch(`${this.chromeCdpUrl}/json/version`, {
+      headers: { Host: "localhost" },
+    });
     if (!versionResp.ok) {
       throw new Error(`Chrome CDP not reachable: HTTP ${versionResp.status}`);
     }
     const versionData = (await versionResp.json()) as { webSocketDebuggerUrl: string };
-    const wsUrl = versionData.webSocketDebuggerUrl;
+    // Chrome returns ws://localhost/... but we need to connect via the Docker hostname
+    const cdpHost = new URL(this.chromeCdpUrl).host;
+    const wsUrl = versionData.webSocketDebuggerUrl.replace(/^ws:\/\/[^/]+/, `ws://${cdpHost}`);
 
     logger.info(`Connecting to Chrome at ${wsUrl}`);
     const browser = await puppeteer.default.connect({ browserWSEndpoint: wsUrl });
