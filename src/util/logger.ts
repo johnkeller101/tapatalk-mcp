@@ -3,6 +3,10 @@ export class Logger {
     this.write("INFO", msg, meta);
   }
 
+  warn(msg: string, meta?: unknown): void {
+    this.write("WARN", msg, meta);
+  }
+
   error(msg: string, meta?: unknown): void {
     this.write("ERROR", msg, meta);
   }

@@ -32,19 +32,19 @@ async function main(): Promise<void> {
   // Create Tapatalk client
   const tapatalk = new TapatalkClient(rpc, config.username, config.password);
 
-  // Verify connectivity by calling get_config
+  // Verify connectivity by calling get_config (non-fatal — tools still register)
   try {
     const forumConfig = await tapatalk.getConfig();
     if (forumConfig.is_open === false) {
-      logger.error("Tapatalk service is not open on this forum");
-      process.exit(1);
+      logger.warn("Tapatalk service is not open on this forum — tools will be available but may fail");
+    } else {
+      logger.info(
+        `Connected to forum (Tapatalk v${forumConfig.version ?? "unknown"}, API level ${forumConfig.api_level ?? "unknown"})`,
+      );
     }
-    logger.info(
-      `Connected to forum (Tapatalk v${forumConfig.version ?? "unknown"}, API level ${forumConfig.api_level ?? "unknown"})`,
-    );
   } catch (e) {
-    logger.error(`Failed to connect to forum: ${(e as Error).message}`);
-    process.exit(1);
+    logger.warn(`Could not connect to forum at startup: ${(e as Error).message}`);
+    logger.warn("Tools will be registered but may fail until connectivity is restored");
   }
 
   // Auto-login if credentials are configured
