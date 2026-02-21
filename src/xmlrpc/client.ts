@@ -47,7 +47,7 @@ export class XmlRpcClient {
         method: "POST",
         headers: {
           "Content-Type": "text/xml; charset=utf-8",
-          "User-Agent": "TapatalkMCP/1.0",
+          "User-Agent": "Tapatalk/8.9.7 (Android; com.quoord.tapatalkpro.activity)",
           "Accept-Encoding": "gzip, deflate",
           ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
         },
